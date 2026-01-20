@@ -1,0 +1,506 @@
+From 1e80bd7b63808fcead1704b87a8a3ffe860c4176 Mon Sep 17 00:00:00 2001
+From: liliyy2 <liwenli0708@gmail.com>
+Date: Tue, 20 Jan 2026 18:36:16 +0800
+Subject: [PATCH] SeGPruner
+
+---
+ llava/model/language_model/llava_qwen.py      |  47 +++-
+ llava/model/llava_arch.py                     | 208 +++++++++++++++---
+ .../multimodal_encoder/siglip_encoder.py      |  26 ++-
+ 3 files changed, 245 insertions(+), 36 deletions(-)
+
+diff --git a/llava/model/language_model/llava_qwen.py b/llava/model/language_model/llava_qwen.py
+index c194747..251f5f6 100755
+--- a/llava/model/language_model/llava_qwen.py
++++ b/llava/model/language_model/llava_qwen.py
+@@ -46,7 +46,7 @@ def __init__(self, config: Qwen2Config):
+ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
+     config_class = LlavaQwenConfig
+ 
+-    def __init__(self, config):
++    def __init__(self, config, visual_token_num, important_ratio, lam):
+         # super(Qwen2ForCausalLM, self).__init__(config)
+         Qwen2ForCausalLM.__init__(self, config)
+         config.model_type = "llava_qwen"
+@@ -54,12 +54,29 @@ def __init__(self, config):
+ 
+         self.model = LlavaQwenModel(config)
+         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
++
++        # [SeGPruner] Visual token pruning config
++        self.visual_token_num = visual_token_num
++        self.important_ratio = important_ratio
++        self.lam = lam
++
+         # Initialize weights and apply final processing
+         self.post_init()
+ 
+     def get_model(self):
+         return self.model
+ 
++    # [SeGPruner] Visual token number
++    def get_visual_token_num(self):
++        return self.visual_token_num
++
++    # [SeGPruner] Important ratio
++    def get_important_ratio(self):
++        return self.important_ratio
++
++    def get_lam(self):
++        return self.lam
++
+     def forward(
+         self,
+         input_ids: torch.LongTensor = None,
+@@ -120,6 +137,9 @@ def generate(
+         images: Optional[torch.Tensor] = None,
+         image_sizes: Optional[torch.Tensor] = None,
+         modalities: Optional[List[str]] = ["image"],
++        depths: Optional[torch.Tensor] = None,
++        poses: Optional[torch.Tensor] = None,
++        intrinsic: Optional[torch.Tensor] = None,
+         **kwargs,
+     ) -> Union[GenerateOutput, torch.LongTensor]:
+         position_ids = kwargs.pop("position_ids", None)
+@@ -128,11 +148,32 @@ def generate(
+             raise NotImplementedError("`inputs_embeds` is not supported")
+ 
+         if images is not None:
+-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
++            (
++                inputs,
++                position_ids,
++                attention_mask,
++                _,
++                inputs_embeds,
++                _,
++                visual_token_num,
++            ) = self.prepare_inputs_labels_for_multimodal(
++                inputs,
++                position_ids,
++                attention_mask,
++                None,
++                None,
++                images,
++                modalities,
++                image_sizes=image_sizes,
++                depths=depths,
++                cam2world=poses,
++                intrinsic=intrinsic,
++            )
+         else:
+             inputs_embeds = self.get_model().embed_tokens(inputs)
++            visual_token_num = 0
+ 
+-        return super().generate(position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
++        return super().generate(position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs), visual_token_num
+ 
+     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+         images = kwargs.pop("images", None)
+diff --git a/llava/model/llava_arch.py b/llava/model/llava_arch.py
+index ea98ae8..1a6aded 100755
+--- a/llava/model/llava_arch.py
++++ b/llava/model/llava_arch.py
+@@ -11,15 +11,19 @@
+ #    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ #    See the License for the specific language governing permissions and
+ #    limitations under the License.
+-
+-
++import os
+ from abc import ABC, abstractmethod
++from datetime import datetime
+ 
+ import math
+ import re
+ import time
++
++import numpy as np
+ import torch
+ import torch.nn as nn
++from transformers.utils.fx import torch_nn_conv1d
++
+ from .multimodal_encoder.builder import build_vision_tower
+ from .multimodal_resampler.builder import build_vision_resampler
+ from .multimodal_projector.builder import build_vision_projector
+@@ -93,7 +97,7 @@ def initialize_vision_modules(self, model_args, fsdp=None):
+         self.config.mm_vision_select_feature = mm_vision_select_feature
+         self.config.mm_patch_merge_type = mm_patch_merge_type
+ 
+-        
++
+         if not hasattr(self.config, 'add_faster_video'):
+             if model_args.add_faster_video:
+                 embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
+@@ -189,12 +193,7 @@ def get_2dPool(self, image_feature, stride=2):
+         image_feature = image_feature.view(num_frames, -1, num_dim)
+         return image_feature
+ 
+-    def encode_images(self, images):
+-        image_features = self.get_model().get_vision_tower()(images)
+-        # image_features = self.get_model().vision_resampler(image_features, images=images)
+-        image_features = self.get_model().mm_projector(image_features)
+-        return image_features
+-    
++
+     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
+         videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
+         per_videos_or_images_features = torch.split(videos_or_images_features, split_sizes, dim=0)  # tuple, (dim_1, 576, 4096)
+@@ -203,7 +202,7 @@ def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=N
+         cur_mm_spatial_pool_stride = self.config.mm_spatial_pool_stride
+ 
+         for idx, feat in enumerate(per_videos_or_images_features):
+-            
++
+             feat = self.get_model().mm_projector(feat)
+             faster_video_feature = 0
+             slower_img_feat = 0
+@@ -248,7 +247,108 @@ def add_token_per_frame(self, image_feature):
+         image_feature = image_feature.permute(1, 2, 0).contiguous()
+         return image_feature
+ 
+-    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None):
++    def compute_projection(self, intrinsic, depth, camera_to_world):
++
++        device = depth.device
++        H, W = depth.shape
++        fx, fy = intrinsic[0][0], intrinsic[1][1]
++        cx, cy = intrinsic[0][2], intrinsic[1][2]
++
++        # pixel grid (u,v)
++        u = torch.arange(W, device=device)
++        v = torch.arange(H, device=device)
++        uu, vv = torch.meshgrid(u, v, indexing='xy')  
++
++        z = depth
++
++        # camera coordinates back projection
++        X = (uu - cx) / fx * z
++        Y = (vv - cy) / fy * z
++        Z = z
++
++        cam_xyz = torch.stack([X, Y, Z, torch.ones_like(Z)], dim=-1)  # (H,W,4)
++        cam_xyz = cam_xyz.view(-1, 4).T  # (4, H*W)
++
++        world = camera_to_world @ cam_xyz  # (4, H*W)
++        world = world[:3].T.view(H, W, 3)  # (H,W,3)
++
++        return world
++
++    def patch_word(self, intrinsic,patchsize, depth, camera2world):
++        world = self.compute_projection(intrinsic, depth, camera2world)
++        H, W = depth.shape
++        Hc = (H // patchsize) * patchsize
++        Wc = (W // patchsize) * patchsize
++        world = world[:Hc, :Wc]  
++        hp = Hc // patchsize
++        wp = Wc // patchsize
++        world = world.view(hp, patchsize, wp, patchsize, 3)
++        num = patchsize * patchsize
++        patch_mean = world.sum(dim=(1, 3)) / num
++        patch_mean = patch_mean.view(-1,3)
++        return patch_mean
++
++    def patch_xyz(self, intrinsic, patchsize, depths, camera2world):
++        B = len(depths)
++        patchs = []
++        for b in range(B):
++            xyz = self.patch_word(intrinsic,patchsize, depths[b], camera2world[b])
++            patchs.append(xyz)
++        return torch.stack(patchs, dim=0).to(depths[0].device)
++
++    # [SeGPruner]
++    def farthest_point_sample(self, intrinsic, images, patchsize, depths, cam2world):
++
++        image_features, image_attentions, attention_map = self.get_model().get_vision_tower()(images, output_attentions=True)
++        B, N, C = image_features.shape
++        device = image_features.device
++
++        patch_xyz = self.patch_xyz(intrinsic, patchsize, depths, cam2world).to(device)
++
++        visual_token_num = self.get_visual_token_num()  # T
++        important_ratio = self.get_important_ratio()  # r
++        lam = self.get_lam()
++        important_token_num = int(visual_token_num * important_ratio)  # T_imp = T * r
++        diverse_token_num = visual_token_num - important_token_num  # T_div = T * (1 - r)
++
++        image_attentions = image_attentions.mean(dim=1)  
++        token_indices = image_attentions.argsort(dim=-1, descending=True)  
++        important_indices = token_indices[:, :important_token_num]  
++        residual_indices = token_indices[:, important_token_num:]  
++        patch_xyz = patch_xyz[torch.arange(B, device=patch_xyz.device).unsqueeze(-1), residual_indices, :]
++
++        image_normalized = image_features / image_features.norm(dim=-1, keepdim=True)  # (B, N, C)
++        image_normalized = image_normalized[torch.arange(B, device=patch_xyz.device).unsqueeze(-1), residual_indices, :]
++
++        residual_num = N - important_token_num
++        centroids = torch.zeros(B, diverse_token_num, dtype=torch.long).to(device)
++        distance = torch.ones(B, residual_num).to(device) * 1e10
++        farthest = torch.zeros(B, dtype=torch.long, device=device)
++        batch_indices = torch.arange(B, dtype=torch.long).to(device)
++        for i in range(diverse_token_num):  
++            centroids[:, i] = farthest
++            centroid = patch_xyz[batch_indices, farthest, :].view(B, 1, 3)
++            dist = torch.cdist(patch_xyz, centroid).squeeze(-1)
++            scores = image_normalized[batch_indices, farthest,:].unsqueeze(1) @ image_normalized.transpose(-1,-2)
++            scores = scores.squeeze(1)
++
++            if i==0:
++                dx = dist.max(-1, keepdim=True)[0]
++            fuse_dist = lam * dist/dx + (1-lam)*(1-scores)
++            mask = fuse_dist < distance
++            distance[mask] = fuse_dist[mask]
++            farthest = torch.max(distance, -1)[1]
++
++        centroids = residual_indices[torch.arange(B, device=patch_xyz.device).unsqueeze(-1), centroids]
++        selected_indices = torch.cat([important_indices, centroids], dim=-1)
++        index_masks = torch.zeros(B, N, dtype=torch.bool, device=device)
++        index_masks.scatter_(1, selected_indices, True)
++
++        image_features = self.get_model().mm_projector(image_features)
++        return image_features, index_masks
++    
++    # [SeGPruner]
++    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, depths=None, cam2world=None, intrinsic=None):
+         vision_tower = self.get_vision_tower()
+         # rank_print(modalities)
+         if vision_tower is None or images is None or input_ids.shape[1] == 1:
+@@ -276,12 +376,15 @@ def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attentio
+ 
+             concat_images = torch.cat([image for image in images_list], dim=0)
+             split_sizes = [image.shape[0] for image in images_list]
+-            encoded_image_features = self.encode_images(concat_images)
+-            # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
++
++            encoded_image_features, index_masks = self.farthest_point_sample(intrinsic, concat_images, 14, depths, cam2world)
++
+ 
+             # This is a list, each element is [num_images, patch * patch, dim]
+             # rank_print(f"Concat images : {concat_images.shape}")
+             encoded_image_features = torch.split(encoded_image_features, split_sizes)
++            index_masks = torch.split(index_masks, split_sizes, dim=0)
++
+             image_features = []
+             for idx, image_feat in enumerate(encoded_image_features):
+                 if idx in video_idx_in_batch:
+@@ -297,10 +400,12 @@ def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attentio
+ 
+             if mm_patch_merge_type == "flat":
+                 image_features = [x.flatten(0, 1) for x in image_features]
++                index_masks = [x.flatten(0, 1) for x in index_masks]
++                image_features = [x[m] for x, m in zip(image_features, index_masks)]
+ 
+             elif mm_patch_merge_type.startswith("spatial"):
+                 new_image_features = []
+-                for image_idx, image_feature in enumerate(image_features):
++                for image_idx, (image_feature, index_mask) in enumerate(zip(image_features, index_masks)):
+                     # FIXME: now assume the image is square, and split to 2x2 patches
+                     # num_patches = h * w, where h = w = sqrt(num_patches)
+                     # currently image_feature is a tensor of shape (4, num_patches, hidden_size)
+@@ -324,16 +429,13 @@ def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attentio
+                                         concat_slow_fater_token.append(torch.cat((faster_video_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
+                                 # import pdb; pdb.set_trace()
+                                 image_feature = torch.cat(concat_slow_fater_token)
+-
+-                                # print("!!!!!!!!!!!!")
+-                        
+                             new_image_features.append(image_feature)
+                         elif mm_newline_position == "frame":
+                             # Frame-wise
+                             image_feature = self.add_token_per_frame(image_feature)
+ 
+                             new_image_features.append(image_feature.flatten(0, 1))
+-                            
++
+                         elif mm_newline_position == "one_token":
+                             # one-token
+                             image_feature = image_feature.flatten(0, 1)
+@@ -342,15 +444,15 @@ def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attentio
+                                     image_feature,
+                                     self.model.image_newline[None].to(image_feature.device)
+                                 ), dim=0)
+-                            new_image_features.append(image_feature)      
++                            new_image_features.append(image_feature)
+                         elif mm_newline_position == "no_token":
+                             new_image_features.append(image_feature.flatten(0, 1))
+                         else:
+                             raise ValueError(f"Unexpected mm_newline_position: {mm_newline_position}")
+                     elif image_feature.shape[0] > 1:  # multi patches and multi images operations
+                         # rank0_print("Single-images")
+-                        base_image_feature = image_feature[0]
+-                        image_feature = image_feature[1:]
++                        base_image_feature, base_index_mask = image_feature[0], index_mask[0]
++                        image_feature, index_mask = image_feature[1:], index_mask[1:]
+                         height = width = self.get_vision_tower().num_patches_per_side
+                         assert height * width == base_image_feature.shape[0]
+ 
+@@ -365,11 +467,16 @@ def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attentio
+                             else:
+                                 raise ValueError("vision_tower_image_size is not found in the vision tower.")
+                             try:
+-                                num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, vision_tower_image_size)
++                                # num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, vision_tower_image_size)
++                                # image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)#(1,1, 27,27,3584)
++                                image_feature = image_feature.view(1, 1, height, width, -1)#(1,1, 27,27,3584)
++                                # index_mask = index_mask.view(num_patch_height, num_patch_width, height, width)
++                                index_mask = index_mask.view(1, 1, height, width)
+                             except Exception as e:
+                                 rank0_print(f"Error: {e}")
+                                 num_patch_width, num_patch_height = 2, 2
+-                            image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
++                            # image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
++                            image_feature = image_feature.view(1, 1, height, width, -1)
+                         else:
+                             image_feature = image_feature.view(2, 2, height, width, -1)
+ 
+@@ -382,7 +489,7 @@ def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attentio
+                             unit = image_feature.shape[2]
+                             image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                             image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+-                            image_feature = unpad_image(image_feature, image_sizes[image_idx])
++                            # image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                             c, h, w = image_feature.shape
+                             times = math.sqrt(h * w / (max_num_patches * unit**2))
+                             if times > 1.1:
+@@ -390,31 +497,74 @@ def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attentio
+                                 image_feature = nn.functional.interpolate(image_feature, [int(h // times), int(w // times)], mode="bilinear")[0]
+                             image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+                             image_feature = image_feature.flatten(1, 2).transpose(0, 1)
++                            ## Vispruner
++                            index_mask = index_mask.permute(0, 2, 1, 3).contiguous().unsqueeze(0)
++                            index_mask = index_mask.flatten(1, 2).flatten(2, 3)
++                            # index_mask = unpad_image(index_mask, image_sizes[image_idx])
++                            index_mask = torch.cat((
++                                index_mask,
++                                torch.ones(*index_mask.shape[:-1], 1, dtype=torch.bool).to(index_mask.device)
++                            ), dim=-1)
++                            index_mask = index_mask.flatten(1, 2).squeeze(0)
++                            image_feature = image_feature[index_mask]
++
+                         elif "unpad" in mm_patch_merge_type:
+                             image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                             image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                             image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                             image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
+                             image_feature = image_feature.flatten(1, 2).transpose(0, 1)
++                            index_mask = index_mask.permute(0, 2, 1, 3).contiguous().unsqueeze(0)
++                            index_mask = index_mask.flatten(1, 2).flatten(2, 3)
++                            index_mask = unpad_image(index_mask, image_sizes[image_idx])
++                            index_mask = torch.cat((
++                                index_mask,
++                                torch.ones(*index_mask.shape[:-1], 1, dtype=torch.bool).to(index_mask.device)
++                            ), dim=-1)
++                            index_mask = index_mask.flatten(1, 2).squeeze(0)
++                            image_feature = image_feature[index_mask]
+                         else:
+                             image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
+                             image_feature = image_feature.flatten(0, 3)
++                            index_mask = index_mask.permute(0, 2, 1, 3).contiguous()
++                            index_mask = index_mask.flatten(0, 3)
++                            image_feature = image_feature[index_mask]
++
++                        # if "nobase" in mm_patch_merge_type:
++                        #     pass
++                        # else:
++                        #     image_feature = torch.cat((base_image_feature, image_feature), dim=0)
++                        # new_image_features.append(image_feature)
+                         if "nobase" in mm_patch_merge_type:
+                             pass
+                         else:
+-                            image_feature = torch.cat((base_image_feature, image_feature), dim=0)
++                            base_image_feature = base_image_feature[base_index_mask]
++                            # image_feature = torch.cat((base_image_feature, image_feature), dim=0)
++                            # image_feature = base_image_feature
++
++
++
+                         new_image_features.append(image_feature)
+                     else:  # single image operations
+                         image_feature = image_feature[0]
++                        index_mask = index_mask[0]
+                         if "unpad" in mm_patch_merge_type:
+-                            image_feature = torch.cat((image_feature, self.model.image_newline[None]), dim=0)
+-
++                            newline = self.model.image_newline[None].to(
++                                device=image_feature.device, dtype=image_feature.dtype, non_blocking=True
++                            )
++                            image_feature = torch.cat((image_feature, newline), dim=0)
++                            index_mask = torch.cat((
++                                index_mask,
++                                torch.ones(1, dtype=torch.bool).to(index_mask.device)
++                            ), dim=0)
++                        image_feature = image_feature[index_mask]
+                         new_image_features.append(image_feature)
+                 image_features = new_image_features
+             else:
+                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
+         else:
+-            image_features = self.encode_images(images)
++            image_features, index_masks = self.encode_images(images)
++            image_features = image_features[index_masks].unsqueeze(0)
+ 
+         # TODO: image start / end is not implemented here to support pretraining.
+         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
+@@ -552,7 +702,7 @@ def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attentio
+             position_ids[:, split_position:] += right_add
+         # import pdb; pdb.set_trace()
+         # rank0_print("Finish preparing")
+-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
++        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, image_features[0].shape[0]
+ 
+     def initialize_vision_tokenizer(self, model_args, tokenizer):
+         if model_args.mm_use_im_patch_token:
+diff --git a/llava/model/multimodal_encoder/siglip_encoder.py b/llava/model/multimodal_encoder/siglip_encoder.py
+index f1e101a..ce9fc2a 100755
+--- a/llava/model/multimodal_encoder/siglip_encoder.py
++++ b/llava/model/multimodal_encoder/siglip_encoder.py
+@@ -546,6 +546,7 @@ def __init__(self, vision_tower, vision_tower_cfg, delay_load=False):
+         self.vision_tower_name = vision_tower
+ 
+         self.image_processor = SigLipImageProcessor()
++        self.select_feature = getattr(vision_tower_cfg, "mm_vision_select_feature", "patch")
+ 
+         if not delay_load:
+             rank0_print(f"Loading vision tower: {vision_tower}")
+@@ -573,7 +574,16 @@ def load_model(self, device_map=None):
+ 
+         self.is_loaded = True
+ 
+-    def forward(self, images):
++    # SeGPruner
++    def feature_select(self, image_forward_outs, output_attentions=False):
++        image_features = image_forward_outs.hidden_states[-1]
++        if output_attentions:
++            # image_attentions [B, h, patch_size* patch_size, patch_size* patch_size][20, 16, 729, 729]
++            image_attentions = image_forward_outs.attentions[-1].mean(dim=-2)# [B, h, patch_size* patch_size]
++            return image_features, image_attentions
++        return image_features
++
++    def forward(self, images, output_attentions=False):
+         if type(images) is list:
+             image_features = []
+             for image in images:
+@@ -582,9 +592,17 @@ def forward(self, images):
+                 assert image_features.shape[-2] == 729
+                 image_features.append(image_feature)
+         else:
+-            image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
+-            image_features = image_forward_outs.hidden_states[-1].to(images.dtype)
+-            assert image_features.shape[-2] == 729
++            image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype),
++                                                   output_hidden_states=True, output_attentions=output_attentions)
++            # image_forward_outs[image features ] (B, 2, 729, D)
++            image_features = self.feature_select(image_forward_outs, output_attentions=output_attentions)
++            if output_attentions:
++                image_features = image_features[0].to(images.dtype), image_features[1], image_forward_outs.attentions[-1]
++            else:
++                image_features = image_features.to(images.dtype)
++            # image_features = image_forward_outs.hidden_states[-1].to(images.dtype)
++
++            # assert image_features.shape[-2] == 729
+ 
+         return image_features
+ 
+-- 
+2.49.0.windows.1
+
